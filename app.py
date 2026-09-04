@@ -1,4 +1,10 @@
+import os
+import sys
 import tempfile
+
+# Ensure local project packages are importable when Streamlit is launched from
+# outside the repository root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 import plotly.graph_objects as go
