@@ -1,67 +1,54 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 
-from inference.simulator import simulate_future
-from models.controller import AdaptiveController
-from models.lightweight_detector import LightweightDetector
-from models.world_model import WorldModel
-from utils.mitre_mapper import get_stage_name
+from models.temporal_transformer import TemporalTransformer
 
-LIGHT_MODEL_PATH = "saved_models/lightweight_detector.pkl"
-
-WORLD_MODEL_PATH = "saved_models/world_model.pt"
+MODEL_PATH = Path(__file__).resolve().parents[1] / "saved_models" / "temporal_transformer.pt"
 
 
 class NetOraclePredictor:
-    def __init__(self):
+    def __init__(self, model_path=MODEL_PATH):
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"Model artifact not found: {model_path}. Run training/train_world_model.py first.")
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        self.sequence_length = int(checkpoint["sequence_length"])
+        self.feature_names = checkpoint["feature_names"]
+        self.mean = np.asarray(checkpoint["normalization_mean"], dtype=np.float32)
+        self.scale = np.asarray(checkpoint["normalization_scale"], dtype=np.float32)
+        self.threshold = float(checkpoint["threshold"])
+        self.model = TemporalTransformer(
+            state_dim=int(checkpoint["state_dim"]), **checkpoint.get("model_config", {})
+        )
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.eval()
 
-        # Lightweight model
-        self.light_model = LightweightDetector()
-
-        self.light_model.load(LIGHT_MODEL_PATH)
-
-        # Controller
-        self.controller = AdaptiveController()
-
-        # Heavy model
-        checkpoint = torch.load(WORLD_MODEL_PATH, map_location="cpu")
-
-        input_size = checkpoint["input_size"]
-
-        self.world_model = WorldModel(input_size=input_size)
-
-        self.world_model.load_state_dict(checkpoint["model_state"])
-
-        self.world_model.eval()
-
-    def analyze(self, states, simulation_steps=3):
-
-        results = []
-
-        for i, state in enumerate(states):
-            anomaly_score = self.light_model.predict(state)
-
-            mode = self.controller.update(anomaly_score)
-
-            result = {"window": i, "anomaly_score": anomaly_score, "mode": mode}
-
-            # Activate World Model only
-            # during deep analysis
-
-            if mode == "DEEP_ANALYSIS" and i >= 9:
-                sequence = states[i - 9 : i + 1]
-
-                future = simulate_future(
-                    self.world_model, sequence, steps=simulation_steps
-                )
-
-                # Convert stage IDs to names
-
-                for prediction in future:
-                    prediction["stage"] = get_stage_name(prediction["stage"])
-
-                result["future_predictions"] = future
-
-            results.append(result)
-
-        return results
+    def analyze(self, states):
+        states = np.asarray(states, dtype=np.float32)
+        if states.ndim != 2 or states.shape[1] != len(self.feature_names) * 2:
+            raise ValueError(f"Expected states with shape [windows, {len(self.feature_names) * 2}], received {states.shape}.")
+        if len(states) < self.sequence_length:
+            raise ValueError(f"At least {self.sequence_length} complete network windows are required for analysis.")
+        sequences = np.asarray(
+            [states[index : index + self.sequence_length] for index in range(len(states) - self.sequence_length + 1)],
+            dtype=np.float32,
+        )
+        normalized = (sequences - self.mean) / self.scale
+        with torch.no_grad():
+            probabilities = torch.sigmoid(self.model(torch.tensor(normalized))).numpy()
+        windows = [
+            {"window": index + self.sequence_length - 1, "risk": float(probability), "status": "Suspicious" if probability >= self.threshold else "Normal"}
+            for index, probability in enumerate(probabilities)
+        ]
+        suspicious = [window for window in windows if window["status"] == "Suspicious"]
+        overall_risk = float(np.max(probabilities))
+        return {
+            "status": "Suspicious" if suspicious else "Normal",
+            "risk": overall_risk,
+            "threshold": self.threshold,
+            "windows_analyzed": len(windows),
+            "suspicious_windows": len(suspicious),
+            "suspicious_percentage": len(suspicious) / len(windows) * 100,
+            "windows": windows,
+        }
